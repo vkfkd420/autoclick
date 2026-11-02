@@ -22,7 +22,7 @@ public class Clicker {
     public volatile bool Paused;
     public volatile bool NoPositions;
     public volatile bool UsePositions;
-    public volatile int Interval = 4;
+    public volatile int IntervalUs = 4000;
     public volatile int Button;
     public volatile bool Suspended;
     public volatile int StartKey = 0x77;
@@ -84,7 +84,7 @@ public class Clicker {
         while (true) {
             if (!Running) { was = false; Paused = false; NoPositions = false; Thread.Sleep(5); continue; }
             double now = sw.Elapsed.TotalMilliseconds;
-            int interval = Interval;
+            double interval = IntervalUs / 1000.0;
             if (!was) { last = now - interval; was = true; idx = 0; }
 
             RECT r; POINT p;
@@ -102,7 +102,7 @@ public class Clicker {
 
             int due = (int)((now - last) / interval);
             if (due < 1) { Thread.Sleep(1); continue; }
-            if (due > 100) { due = 100; last = now; } else { last += due * interval; }
+            if (due > 1000) { due = 1000; last = now; } else { last += due * interval; }
 
             uint down = Button == 0 ? 0x0002u : 0x0008u;
             uint up = Button == 0 ? 0x0004u : 0x0010u;
@@ -694,6 +694,10 @@ public class PosList : Control {
 
 $MIN_MS = 1
 $MAX_MS = 500
+$MIN_INPUT = 0.1
+$script:interval = 4.0
+$script:syncingBar = $false
+$inv = [System.Globalization.CultureInfo]::InvariantCulture
 
 $cBg     = [System.Drawing.ColorTranslator]::FromHtml("#FFFFFF")
 $cText   = [System.Drawing.ColorTranslator]::FromHtml("#1F2430")
@@ -768,7 +772,7 @@ $txtValue.Font = $fontBig
 $txtValue.BorderStyle = "None"
 $txtValue.BackColor = $cBg
 $txtValue.ForeColor = $cText
-$txtValue.MaxLength = 3
+$txtValue.MaxLength = 5
 $txtValue.TextAlign = "Left"
 
 $lblUnit = New-Label "ms" 118 40 $cMuted $fontUnit
@@ -906,10 +910,17 @@ $script:usePos = $false
 $script:markers = New-Object System.Collections.ArrayList
 $script:markerSig = ""
 
-function Update-Value {
-    $clicker.Interval = $bar.Value
-    if ($txtValue.Text -ne "$($bar.Value)" -and -not $script:typing) { $txtValue.Text = "$($bar.Value)" }
-    $lblCps.Text = "초당 약 $([math]::Round(1000 / $bar.Value, 1))회 클릭"
+function Format-Ms($ms) { $ms.ToString("0.#", $inv) }
+
+function Set-Interval($ms, $fromText) {
+    $ms = [math]::Round([math]::Max($MIN_INPUT, [math]::Min($MAX_MS, $ms)), 1)
+    $script:interval = $ms
+    $clicker.IntervalUs = [int][math]::Round($ms * 1000)
+    $script:syncingBar = $true
+    $bar.Value = [int][math]::Max($MIN_MS, [math]::Min($MAX_MS, [math]::Round($ms)))
+    $script:syncingBar = $false
+    if (-not $fromText) { $txtValue.Text = Format-Ms $ms }
+    $lblCps.Text = "초당 약 $([math]::Round(1000 / $ms, 1))회 클릭"
 }
 
 function Update-Idle {
@@ -1004,40 +1015,49 @@ $clicker.StartKey = $hkStart.Code
 $clicker.StopKey = $hkStop.Code
 $clicker.RecordKey = $hkRec.Code
 $clicker.FormHandle = $form.Handle
-Update-Value
+Set-Interval 4 $false
 Update-Idle
 Update-Empty
 Update-AdvState
 Set-Rounded $lblAdvState 9
 
-function Commit-Value {
-    $n = 0
-    if ([int]::TryParse($txtValue.Text, [ref]$n)) {
-        $n = [math]::Max($MIN_MS, [math]::Min($MAX_MS, $n))
-        $bar.Value = $n
-    }
-    $script:typing = $false
-    $txtValue.Text = "$($bar.Value)"
-    Update-Value
+function Parse-Ms($text) {
+    $n = 0.0
+    if ([double]::TryParse($text, [System.Globalization.NumberStyles]::Float, $inv, [ref]$n)) { return $n }
+    return $null
 }
 
-$bar.Add_ValueChanged({ Update-Value })
+function Commit-Value {
+    $n = Parse-Ms $txtValue.Text
+    if ($null -eq $n) { $n = $script:interval }
+    Set-Interval $n $false
+}
+
+$bar.Add_ValueChanged({ if (-not $script:syncingBar) { Set-Interval $bar.Value $false } })
 
 $txtValue.Add_KeyPress({
-    if (-not [char]::IsDigit($_.KeyChar) -and -not [char]::IsControl($_.KeyChar)) { $_.Handled = $true }
+    $c = $_.KeyChar
+    if ([char]::IsControl($c) -or [char]::IsDigit($c)) { return }
+    if ($c -eq '.' -and (-not $txtValue.Text.Contains('.') -or $txtValue.SelectionLength -eq $txtValue.Text.Length)) { return }
+    $_.Handled = $true
 })
 $txtValue.Add_TextChanged({
-    $n = 0
-    if ($txtValue.Focused -and [int]::TryParse($txtValue.Text, [ref]$n) -and $n -ge $MIN_MS -and $n -le $MAX_MS) {
-        $script:typing = $true
-        $bar.Value = $n
-        $script:typing = $false
-    }
+    if (-not $txtValue.Focused) { return }
+    $n = Parse-Ms $txtValue.Text
+    if ($null -ne $n -and $n -ge $MIN_INPUT -and $n -le $MAX_MS) { Set-Interval $n $true }
 })
 $txtValue.Add_KeyDown({
     if ($_.KeyCode -eq "Return") { $_.SuppressKeyPress = $true; Commit-Value; $bar.Focus() }
-    elseif ($_.KeyCode -eq "Up") { $_.SuppressKeyPress = $true; $bar.Value = [math]::Min($MAX_MS, $bar.Value + 1); Commit-Value }
-    elseif ($_.KeyCode -eq "Down") { $_.SuppressKeyPress = $true; $bar.Value = [math]::Max($MIN_MS, $bar.Value - 1); Commit-Value }
+    elseif ($_.KeyCode -eq "Up") {
+        $_.SuppressKeyPress = $true
+        $step = if ($script:interval -lt 1) { 0.1 } else { 1 }
+        Set-Interval ($script:interval + $step) $false
+    }
+    elseif ($_.KeyCode -eq "Down") {
+        $_.SuppressKeyPress = $true
+        $step = if ($script:interval -le 1) { 0.1 } else { 1 }
+        Set-Interval ($script:interval - $step) $false
+    }
 })
 $txtValue.Add_Enter({ $underline.BackColor = $cAccent; $txtValue.SelectAll() })
 $txtValue.Add_Leave({ $underline.BackColor = $cLine; Commit-Value })
@@ -1072,6 +1092,7 @@ $cmbButton.Add_SelectedIndexChanged({ $clicker.Button = $cmbButton.SelectedIndex
 $lblAdvState.Add_Click({ Set-UsePositions (-not $script:usePos) })
 $tip = New-Object System.Windows.Forms.ToolTip
 $tip.SetToolTip($lblAdvState, "클릭하면 저장한 위치 모드를 켜고 끕니다")
+$tip.SetToolTip($txtValue, "0.1ms까지 직접 입력할 수 있어요 (슬라이더는 1ms부터)")
 foreach ($hk in $hkStart, $hkStop, $hkRec) {
     $tip.SetToolTip($hk, "클릭한 뒤 원하는 키를 누르세요 (Ctrl, Alt, Shift 조합도 가능). 취소는 Esc")
 }
